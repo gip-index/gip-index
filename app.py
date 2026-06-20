@@ -9,6 +9,8 @@ import re
 import logging
 import tweepy
 import resend
+import openai
+from datetime import datetime as dt
 
 # ---------- AI PROVIDERS ----------
 from groq import Groq
@@ -37,6 +39,11 @@ GEMINI_KEY_1 = os.environ.get("GEMINI_API_KEY_1")
 GEMINI_KEY_2 = os.environ.get("GEMINI_API_KEY_2")
 GEMINI_KEY_3 = os.environ.get("GEMINI_API_KEY_3")
 
+# ---------- ADDITIONAL AI PROVIDERS ----------
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+
 app = Flask(__name__)
 CORS(app)
 logging.basicConfig(level=logging.INFO)
@@ -45,28 +52,36 @@ score_history = deque(maxlen=7)
 
 # ---------- HELPERS ----------
 def fetch_soup(url, timeout=10):
-    r = requests.get(url, timeout=timeout)
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    }
+    r = requests.get(url, timeout=timeout, headers=headers)
     return BeautifulSoup(r.text, 'html.parser')
 
 def extract_text(soup, max_chars=4000):
-    for selector in ['article', 'div#content', 'body']:
-        if selector == 'div#content':
-            tag = soup.find('div', id='content')
-        else:
-            tag = soup.select_one(selector)
+    for selector in ['article', 'div#content', 'div.content', 'main', 'div.article-body', 'div.story-body']:
+        tag = soup.select_one(selector)
         if tag:
-            return tag.get_text()[:max_chars]
+            text = tag.get_text(separator=' ', strip=True)
+            if len(text) > 100:
+                return text[:max_chars]
+    paragraphs = soup.find_all('p')
+    if paragraphs:
+        text = ' '.join([p.get_text(strip=True) for p in paragraphs])
+        if len(text) > 100:
+            return text[:max_chars]
+    body = soup.find('body')
+    if body:
+        return body.get_text(separator=' ', strip=True)[:max_chars]
     return ""
 
 def looks_like_individual_doc(url):
-    # Generic filter; adjust per source as needed
     if any(kw in url for kw in ['rss', '.xml']):
         return False
     return True
 
 # ---------- SOURCE SCRAPERS (INFLATION‑SPECIFIC) ----------
 def scrape_earnings_calls():
-    """Scrape earnings call transcripts for inflation language from Fool.com."""
     sources = []
     try:
         soup = fetch_soup("https://www.fool.com/earnings-call-transcripts/")
@@ -84,7 +99,6 @@ def scrape_earnings_calls():
     return sources
 
 def scrape_ism_report():
-    """Scrape the latest ISM Manufacturing PMI report for price pressure language."""
     sources = []
     try:
         soup = fetch_soup("https://www.ismworld.org/supply-management-news-and-reports/reports/ism-report-on-business/")
@@ -102,7 +116,6 @@ def scrape_ism_report():
     return sources
 
 def scrape_bls_cpi():
-    """Scrape the BLS CPI news release for inflation language."""
     sources = []
     try:
         soup = fetch_soup("https://www.bls.gov/news.release/cpi.nr0.htm")
@@ -117,7 +130,6 @@ def scrape_bls_cpi():
     return sources
 
 def scrape_shipping_statements():
-    """Scrape Maersk press releases for supply chain / freight language."""
     sources = []
     try:
         soup = fetch_soup("https://www.maersk.com/news/articles")
@@ -135,7 +147,6 @@ def scrape_shipping_statements():
     return sources
 
 def scrape_inflation_news():
-    """Scrape recent inflation‑related headlines from Reuters."""
     sources = []
     try:
         soup = fetch_soup("https://www.reuters.com/markets/commodities/")
@@ -153,7 +164,6 @@ def scrape_inflation_news():
     return sources
 
 def scrape_commodity_prices():
-    """Scrape commodity price data from Yahoo Finance (e.g., gold, oil) as a sentiment proxy."""
     sources = []
     try:
         soup = fetch_soup("https://finance.yahoo.com/news/")
@@ -196,8 +206,6 @@ Text:
                 return max(0, min(100, score))
         except Exception as e:
             logging.warning(f"Groq failed ({e}), falling back to Gemini-1...")
-    else:
-        logging.info("Groq client not available, skipping to Gemini...")
     if GEMINI_KEY_1:
         try:
             gemini_client = genai.Client(api_key=GEMINI_KEY_1)
@@ -245,19 +253,63 @@ Text:
                 logging.info(f"AI score (Gemini-3): {score}")
                 return max(0, min(100, score))
         except Exception as e:
-            logging.error(f"All AI providers failed: {e}")
+            logging.warning(f"Gemini-3 failed ({e}), falling back to DeepSeek...")
+    
+    # Tier 5: DeepSeek
+    if DEEPSEEK_API_KEY and DEEPSEEK_API_KEY.strip():
+        try:
+            deepseek_client = openai.OpenAI(
+                api_key=DEEPSEEK_API_KEY,
+                base_url="https://api.deepseek.com/v1"
+            )
+            response = deepseek_client.chat.completions.create(
+                model="deepseek-v4-flash",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0,
+                max_tokens=5
+            )
+            score_str = response.choices[0].message.content.strip()
+            digits = re.findall(r'\d+', score_str)
+            if digits:
+                score = int(digits[0])
+                logging.info(f"AI score (DeepSeek): {score}")
+                return max(0, min(100, score))
+        except Exception as e:
+            logging.warning(f"DeepSeek failed ({e}), falling back to OpenRouter...")
+    
+    # Tier 6: OpenRouter
+    if OPENROUTER_API_KEY and OPENROUTER_API_KEY.strip():
+        try:
+            openrouter_client = openai.OpenAI(
+                api_key=OPENROUTER_API_KEY,
+                base_url=OPENROUTER_BASE_URL
+            )
+            response = openrouter_client.chat.completions.create(
+                model="openai/gpt-3.5-turbo",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0,
+                max_tokens=5
+            )
+            score_str = response.choices[0].message.content.strip()
+            digits = re.findall(r'\d+', score_str)
+            if digits:
+                score = int(digits[0])
+                logging.info(f"AI score (OpenRouter): {score}")
+                return max(0, min(100, score))
+        except Exception as e:
+            logging.error(f"OpenRouter failed ({e})")
             return None
-    logging.error("No Gemini API keys configured")
+
+    # If we've made it here, all AI providers have failed
+    logging.error("All AI providers failed (Groq, Gemini 1-3, DeepSeek, OpenRouter)")
     return None
 
 # ---------- MARKET EXPECTATION (BREAKEVEN INFLATION + COMMODITIES) ----------
 def compute_market_gip():
-    """Return a 0‑100 score derived from breakeven inflation (TIPS) and commodity prices."""
     be_rate = None
     gold_change = 0
     oil_change = 0
 
-    # 1. Breakeven inflation (5‑year TIPS spread) via FRED
     fred_api_key = os.environ.get("FRED_API_KEY")
     if fred_api_key:
         try:
@@ -272,7 +324,6 @@ def compute_market_gip():
         except Exception as e:
             logging.warning(f"FRED breakeven error: {e}")
 
-    # 2. Gold price change (via Yahoo Finance) – proxy for inflation fears
     try:
         gold_url = "https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval=1d&range=1d"
         resp = requests.get(gold_url, timeout=15)
@@ -287,7 +338,6 @@ def compute_market_gip():
     except Exception as e:
         logging.warning(f"Gold price error: {e}")
 
-    # 3. Oil price change (WTI) – proxy for supply‑side inflation
     try:
         oil_url = "https://query1.finance.yahoo.com/v8/finance/chart/CL=F?interval=1d&range=1d"
         resp = requests.get(oil_url, timeout=15)
@@ -302,7 +352,6 @@ def compute_market_gip():
     except Exception as e:
         logging.warning(f"Oil price error: {e}")
 
-    # Map to 0‑100 scores
     be_score = 50
     if be_rate is not None and be_rate > 0:
         be_score = min(100, max(0, (be_rate - 1.5) * (100 / 2.0)))
@@ -435,7 +484,6 @@ def market_gip():
 def home():
     return "G-Pulse (GIP) Global Inflation Pulse is live. Use /api/gip_latest"
 
-# ---------- X AUTO‑POST ENDPOINT (OPTIONAL) ----------
 @app.route('/post_tweet')
 def auto_post():
     try:
