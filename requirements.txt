@@ -7,3 +7,4 @@ flask-cors
 google-genai
 tweepy
 resend
+openai
