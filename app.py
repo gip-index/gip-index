@@ -526,5 +526,66 @@ def auto_post():
         logging.error(f"Auto‑post failed: {e}")
         return jsonify({"status": f"Error posting tweet: {e}"})
 
+@app.route('/api/gip_drivers')
+def gip_drivers():
+    """Return the core inflation drivers: CPI, Core PCE, 5‑year breakeven."""
+    import requests
+    import os
+    
+    fred_api_key = os.environ.get("FRED_API_KEY")
+    if not fred_api_key:
+        return jsonify({"error": "FRED_API_KEY not configured"}), 500
+    
+    drivers = {}
+    
+    # CPI (year‑over‑year)
+    try:
+        resp = requests.get(
+            f"https://api.stlouisfed.org/fred/series/observations?series_id=CPIAUCSL&api_key={fred_api_key}&file_type=json&sort_order=desc&limit=2",
+            timeout=10
+        )
+        if resp.status_code == 200:
+            obs = resp.json().get("observations", [])
+            if len(obs) >= 2:
+                current = float(obs[0].get("value", 0))
+                previous = float(obs[1].get("value", 0))
+                drivers['cpi_yoy'] = round(((current / previous) - 1) * 100, 2)
+            else:
+                drivers['cpi_yoy'] = "N/A"
+    except Exception as e:
+        drivers['cpi_yoy'] = "N/A"
+    
+    # Core PCE
+    try:
+        resp = requests.get(
+            f"https://api.stlouisfed.org/fred/series/observations?series_id=PCEPI&api_key={fred_api_key}&file_type=json&sort_order=desc&limit=1",
+            timeout=10
+        )
+        if resp.status_code == 200:
+            obs = resp.json().get("observations", [])
+            if obs:
+                drivers['core_pce'] = float(obs[0].get("value", 0))
+            else:
+                drivers['core_pce'] = "N/A"
+    except Exception as e:
+        drivers['core_pce'] = "N/A"
+    
+    # 5‑year breakeven inflation
+    try:
+        resp = requests.get(
+            f"https://api.stlouisfed.org/fred/series/observations?series_id=T5YIE&api_key={fred_api_key}&file_type=json&sort_order=desc&limit=1",
+            timeout=10
+        )
+        if resp.status_code == 200:
+            obs = resp.json().get("observations", [])
+            if obs:
+                drivers['breakeven_5y'] = float(obs[0].get("value", 0))
+            else:
+                drivers['breakeven_5y'] = "N/A"
+    except Exception as e:
+        drivers['breakeven_5y'] = "N/A"
+    
+    return jsonify(drivers)
+
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 8080)))
